@@ -1,0 +1,217 @@
+#!/usr/bin/env lua5.1
+-- bin/luaobf
+-- CLI entry point for the Lua source obfuscator.
+--
+-- Usage:
+--   luaobf [options] input.lua -o output.lua
+--   lua bin/luaobf [options] input.lua -o output.lua
+--
+-- Options:
+--   -o, --output FILE     write obfuscated source to FILE (default: stdout)
+--       --stdout          force output to stdout
+--       --seed N          PRNG seed (integer) for reproducible output
+--       --target VER      target runtime: 5.1 | 5.4 | luajit (default 5.1)
+--       --enable NAME     enable a technique (string_encrypt|virtualize|vm_flatten|antitamper)
+--       --disable NAME    disable a technique
+--       --config FILE     load a Lua config file returning a table of overrides
+--       --version         print version and exit
+--   -h, --help            print this help and exit
+--
+-- NOTE: For FEAT-001 the pipeline is the identity transform (no passes run even
+-- if techniques are enabled); later features activate the passes.
+
+-- ---- resolve module search path relative to this script ----
+local function script_dir()
+  local src = arg and arg[0] or "bin/luaobf"
+  local dir = string.match(src, "^(.*)[/\\][^/\\]+$")
+  return dir or "."
+end
+
+local SELF_DIR = script_dir()
+-- src/ lives alongside bin/ one level up
+local ROOT = string.match(SELF_DIR, "^(.*)[/\\]bin$") or (SELF_DIR .. "/..")
+package.path = ROOT .. "/src/?.lua;" .. ROOT .. "/src/?/init.lua;" .. package.path
+
+local pipeline = require("obf.pipeline")
+local config = require("obf.config")
+
+local VERSION = "0.1.0"
+
+local USAGE = [[
+luaobf ]] .. VERSION .. [[ - Lua source obfuscator
+
+Usage:
+  luaobf [options] input.lua -o output.lua
+  lua bin/luaobf [options] input.lua -o output.lua
+
+Options:
+  -o, --output FILE     write obfuscated source to FILE (default: stdout)
+      --stdout          force output to stdout
+      --seed N          PRNG seed (integer) for reproducible output
+      --target VER      target runtime: 5.1 | 5.4 | luajit (default 5.1)
+      --enable NAME     enable technique: string_encrypt|virtualize|vm_flatten|antitamper
+      --disable NAME    disable technique (same names)
+      --antitamper-mode M  anti-tamper reaction: error|lock|silent (default error)
+      --config FILE     load a Lua config file returning a table of overrides
+      --report          print a protection report to stderr (e.g. how many
+                        functions were virtualized) after obfuscating
+      --version         print version and exit
+  -h, --help            print this help and exit
+]]
+
+local function die(msg)
+  io.stderr:write("luaobf: " .. msg .. "\n")
+  os.exit(1)
+end
+
+local function read_file(path)
+  local f, err = io.open(path, "rb")
+  if not f then die("cannot open input '" .. path .. "': " .. tostring(err)) end
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+local function write_file(path, data)
+  local f, err = io.open(path, "wb")
+  if not f then die("cannot open output '" .. path .. "': " .. tostring(err)) end
+  f:write(data)
+  f:close()
+end
+
+local TECHNIQUES = {
+  string_encrypt = true, virtualize = true, vm_flatten = true, antitamper = true,
+}
+
+local function parse_args(argv)
+  local opts = {
+    input = nil,
+    output = nil,
+    stdout = false,
+    overrides = {},
+    configFile = nil,
+    report = false,
+  }
+  local i = 1
+  while i <= #argv do
+    local a = argv[i]
+    if a == "-h" or a == "--help" then
+      io.write(USAGE)
+      os.exit(0)
+    elseif a == "--version" then
+      io.write("luaobf " .. VERSION .. "\n")
+      os.exit(0)
+    elseif a == "-o" or a == "--output" then
+      i = i + 1
+      opts.output = argv[i] or die("--output requires a FILE argument")
+    elseif a == "--stdout" then
+      opts.stdout = true
+    elseif a == "--report" then
+      opts.report = true
+    elseif a == "--seed" then
+      i = i + 1
+      local n = tonumber(argv[i])
+      if not n then die("--seed requires a numeric argument") end
+      opts.overrides.seed = n
+    elseif a == "--target" then
+      i = i + 1
+      opts.overrides.target = argv[i] or die("--target requires VER")
+    elseif a == "--antitamper-mode" then
+      i = i + 1
+      opts.overrides.antitamper_mode = argv[i] or die("--antitamper-mode requires error|lock|silent")
+    elseif a == "--enable" then
+      i = i + 1
+      local name = argv[i]
+      if not TECHNIQUES[name] then die("unknown technique '" .. tostring(name) .. "'") end
+      opts.overrides[name] = true
+    elseif a == "--disable" then
+      i = i + 1
+      local name = argv[i]
+      if not TECHNIQUES[name] then die("unknown technique '" .. tostring(name) .. "'") end
+      opts.overrides[name] = false
+    elseif a == "--config" then
+      i = i + 1
+      opts.configFile = argv[i] or die("--config requires a FILE")
+    elseif string.sub(a, 1, 1) == "-" and a ~= "-" then
+      die("unknown option '" .. a .. "' (try --help)")
+    else
+      if opts.input then die("multiple input files given") end
+      opts.input = a
+    end
+    i = i + 1
+  end
+  return opts
+end
+
+local function load_config_file(path)
+  local chunk, err
+  if loadfile then chunk, err = loadfile(path) end
+  if not chunk then die("cannot load config '" .. path .. "': " .. tostring(err)) end
+  local ok, tbl = pcall(chunk)
+  if not ok then die("error running config '" .. path .. "': " .. tostring(tbl)) end
+  if type(tbl) ~= "table" then die("config file must return a table") end
+  return tbl
+end
+
+local function main(argv)
+  local opts = parse_args(argv)
+  if not opts.input then
+    io.write(USAGE)
+    os.exit(opts.input == nil and 1 or 0)
+  end
+
+  local cfg = config.new()
+  -- apply config file first, then CLI overrides win
+  if opts.configFile then
+    for k, v in pairs(load_config_file(opts.configFile)) do cfg[k] = v end
+  end
+  for k, v in pairs(opts.overrides) do cfg[k] = v end
+  -- default seed when none provided: derive from time so unseeded runs differ,
+  -- but note the PRNG itself is deterministic given this seed.
+  if cfg.seed == nil then
+    cfg.seed = os.time() % 2147483647
+  end
+  cfg.chunkname = opts.input
+
+  local ok, msg = config.validate(cfg)
+  if not ok then die(msg) end
+
+  local src = read_file(opts.input)
+  local okp, result, ctx = pcall(pipeline.process_ex, src, cfg)
+  if not okp then die(tostring(result)) end
+
+  if opts.report then
+    local rep = ctx and ctx.report or {}
+    local v = rep.virtualize
+    io.stderr:write("luaobf report:\n")
+    if v then
+      io.stderr:write(string.format("  virtualized functions: %d\n", v.count or 0))
+      if v.names and #v.names > 0 then
+        io.stderr:write("    names: " .. table.concat(v.names, ", ") .. "\n")
+      end
+      if v.skipped and #v.skipped > 0 then
+        io.stderr:write(string.format("  left native (fallback): %d\n", #v.skipped))
+      end
+      io.stderr:write(string.format("  VM control-flow flattened: %s\n",
+        v.flattened and "yes" or "no"))
+    else
+      io.stderr:write("  virtualize pass not run\n")
+    end
+    local at = rep.antitamper
+    if at then
+      io.stderr:write(string.format("  anti-tamper: active (mode=%s, woven=%s)\n",
+        tostring(at.mode), at.woven and "yes" or "no"))
+    else
+      io.stderr:write("  anti-tamper: off\n")
+    end
+  end
+
+  if opts.output and not opts.stdout then
+    write_file(opts.output, result)
+  else
+    io.write(result)
+    if string.sub(result, -1) ~= "\n" then io.write("\n") end
+  end
+end
+
+main(arg)

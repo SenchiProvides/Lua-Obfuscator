@@ -1,0 +1,10 @@
+# Generated demo outputs (regenerable with `make demo SEED=<n>`)
+examples/*.obf.lua
+
+# Temp files from the test harness / obfuscator
+*.tmp.lua
+*.tmp
+
+# Editor / OS cruft
+*~
+.DS_Store
